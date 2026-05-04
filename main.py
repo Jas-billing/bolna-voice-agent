@@ -1567,21 +1567,32 @@ async def vapi_webhook(request: Request) -> dict[str, Any]:
     if message_type == "tool-calls":
         results = []
         for tool_call in _tool_calls(message):
-            name = _tool_name(tool_call)
-            if name != "handle_customer_turn":
-                logger.info(f"Ignoring unsupported tool call | tool_name={name}")
-                continue
-            arguments = _tool_arguments(tool_call)
-            arguments["call_id"] = arguments.get("call_id") or get_call_id({"message": message, "tool_call": tool_call})
-            arguments["current_state"] = arguments.get("current_state") or "verify_borrower"
-            tool_request = VapiToolCallRequest.model_validate(arguments)
-            result = handle_customer_turn(tool_request)
-            results.append(
-                {
-                    "toolCallId": tool_call.get("id") or tool_call.get("toolCallId"),
-                    "result": json.dumps(result.model_dump(mode="json")),
-                }
-            )
+            tool_call_id = tool_call.get("id") or tool_call.get("toolCallId")
+            try:
+                name = _tool_name(tool_call)
+                if name != "handle_customer_turn":
+                    logger.info(f"Ignoring unsupported tool call | tool_name={name}")
+                    continue
+                arguments = _tool_arguments(tool_call)
+                arguments["call_id"] = arguments.get("call_id") or get_call_id({"message": message, "tool_call": tool_call})
+                arguments["current_state"] = arguments.get("current_state") or "verify_borrower"
+                tool_request = VapiToolCallRequest.model_validate(arguments)
+                result = handle_customer_turn(tool_request)
+                results.append(
+                    {
+                        "toolCallId": tool_call_id,
+                        "result": json.dumps(result.model_dump(mode="json")),
+                    }
+                )
+            except Exception as exc:
+                logger.exception(f"Vapi tool-call webhook failed | tool_call_id={tool_call_id}")
+                fallback = _technical_failure_response(exc)
+                results.append(
+                    {
+                        "toolCallId": tool_call_id,
+                        "result": json.dumps(fallback.model_dump(mode="json")),
+                    }
+                )
         return {"results": results}
 
     if message_type in {"end-of-call-report", "call-ended", "end_call_report"}:
@@ -1591,6 +1602,19 @@ async def vapi_webhook(request: Request) -> dict[str, Any]:
 
     logger.info(f"Unsupported Vapi webhook message type | message_type={message_type}")
     return {"status": "ignored"}
+
+
+def _technical_failure_response(exc: Exception) -> BackendResponse:
+    return _end(
+        "technical-failure",
+        "I cannot verify this right now. I will arrange a callback from our support team within 24 to 48 hours. Thank you for your time.",
+        end_reason="technical_failure",
+        data={
+            "technical_failure": True,
+            "error_type": type(exc).__name__,
+            "requires_human_callback": True,
+        },
+    )
 
 
 def handle_customer_turn(payload: VapiToolCallRequest) -> BackendResponse:
