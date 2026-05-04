@@ -757,6 +757,7 @@ RESPONSES = {
     "not_verify": "I'm sorry, I can only continue after speaking with the borrower. I will call back later. Thank you.",
     "human": "I understand. I will arrange a callback from our support team within 24 to 48 hours.",
     "unknown": "I am not able to verify that right now. I will flag this for human follow-up.",
+    "input_not_captured": "Sorry, I did not catch that clearly. Could you please repeat?",
 }
 
 
@@ -819,9 +820,14 @@ def process(
             return _callback_request(call_id, latest_user_utterance, slots, data)
         if _is_affirmative(latest_user_utterance) or final_intent in {"aware", "unaware", "borrower_confirmed"}:
             return _ask("confirm_awareness", "dues-disclosed", _response("dues", session, slots), "awareness_confirmation", data)
+        return _input_not_captured(state, data, session, slots)
 
     if state in {"explain_dues", "confirm_awareness", "classify_intent"}:
-        if final_intent in {"aware", "unaware", "needs_help", "unknown"} or (
+        if state in {"explain_dues", "confirm_awareness"} and final_intent == "unknown":
+            return _input_not_captured(state, data, session, slots)
+        if state == "classify_intent" and final_intent == "unknown":
+            return _input_not_captured(state, data, session, slots)
+        if final_intent in {"aware", "unaware", "needs_help"} or (
             state == "confirm_awareness"
             and (final_intent == "borrower_confirmed" or _is_affirmative(latest_user_utterance))
         ):
@@ -836,6 +842,16 @@ def process(
 
     if state == "capture_payment_mode":
         payment_mode = _payment_mode(latest_user_utterance, slots)
+        link_channel = _link_channel(latest_user_utterance, slots)
+        if payment_mode and link_channel in {"sms", "whatsapp"}:
+            send_payment_link_simulated(call_id, link_channel, _customer_name(session, slots), _emi_due(session, slots))
+            return _ask(
+                "post_link_support_check",
+                f"payment_mode_and_payment_link_{link_channel}_captured",
+                RESPONSES["post_link_check"],
+                "post_link_support_check",
+                data | {"payment_mode": payment_mode, "link_channel": link_channel},
+            )
         if payment_mode:
             return _ask(
                 "offer_payment_link",
@@ -844,7 +860,7 @@ def process(
                 "link_channel",
                 data | {"payment_mode": payment_mode},
             )
-        return _ask("capture_payment_mode", "payment_mode_required", RESPONSES["payment_mode"], "payment_mode", data)
+        return _input_not_captured("capture_payment_mode", data, session, slots)
 
     if state == "offer_payment_link":
         channel = _link_channel(latest_user_utterance, slots)
@@ -857,11 +873,13 @@ def process(
                 "post_link_support_check",
                 data | {"link_channel": channel},
             )
-        return _ask("offer_payment_link", "link_channel_required", RESPONSES["payment_link"], "link_channel", data)
+        return _input_not_captured("offer_payment_link", data, session, slots)
 
     if state == "post_link_support_check":
-        if _is_negative(latest_user_utterance) or final_intent in {"unknown", "borrower_confirmed"}:
+        if _is_negative(latest_user_utterance) or final_intent == "borrower_confirmed":
             return _end("business_flow_completed", RESPONSES["close"], "business_flow_completed", data)
+        if final_intent == "unknown":
+            return _input_not_captured("post_link_support_check", data, session, slots)
         transfer_to_human_simulated(call_id, "additional_query_after_ptp")
         return _end(
             "human-callback-requested",
@@ -872,6 +890,8 @@ def process(
         )
 
     if state == "schedule_callback":
+        if not (slots.get("callback_datetime") or _extract_callback_datetime(latest_user_utterance)):
+            return _input_not_captured("schedule_callback", data, session, slots)
         return _callback_request(call_id, latest_user_utterance, slots, data)
 
     if state in {"escalate", "close", "end_call"}:
@@ -1131,6 +1151,52 @@ def _callback_request(call_id: str, utterance: str, slots: dict[str, Any], data:
             data | {"callback_datetime": callback_datetime, "requires_human_callback": True},
         )
     return _ask("schedule_callback", "callback-requested", RESPONSES["callback_request"], "callback_datetime", data)
+
+
+def _input_not_captured(
+    state: str,
+    data: dict[str, Any],
+    session: dict[str, Any],
+    slots: dict[str, Any],
+) -> BackendResponse:
+    return _ask(
+        state,
+        "input-not-captured",
+        _input_not_captured_response(state, session, slots),
+        _required_slot_for_state(state),
+        data | {"input_not_captured": True},
+    )
+
+
+def _input_not_captured_response(state: str, session: dict[str, Any], slots: dict[str, Any]) -> str:
+    retry_prompts = {
+        "verify_borrower": f"Sorry, I did not catch that clearly. Am I speaking with {_customer_name(session, slots)}?",
+        "self_identification": "Sorry, I did not catch that clearly. Is now a good time for a quick two-minute call?",
+        "explain_dues": "Sorry, I did not catch that clearly. Were you aware of this overdue EMI?",
+        "confirm_awareness": "Sorry, I did not catch that clearly. Were you aware of this overdue EMI?",
+        "classify_intent": "Sorry, I did not catch that clearly. Would you be able to make the EMI payment now or within the next few days?",
+        "capture_commitment_date": "Sorry, I did not catch that clearly. Could you please confirm the exact date you plan to pay?",
+        "capture_payment_mode": "Sorry, I did not catch that clearly. Which mode will you use — UPI, net banking, card, or cash deposit?",
+        "offer_payment_link": "Sorry, I did not catch that clearly. Should I send the payment link by SMS or WhatsApp?",
+        "post_link_support_check": "Sorry, I did not catch that clearly. Is there anything else you need help with?",
+        "schedule_callback": "Sorry, I did not catch that clearly. What would be a better time for a callback?",
+    }
+    return retry_prompts.get(state, RESPONSES["input_not_captured"])
+
+
+def _required_slot_for_state(state: str) -> str | None:
+    return {
+        "verify_borrower": "borrower_confirmation",
+        "self_identification": "good_time_confirmation",
+        "explain_dues": "awareness_confirmation",
+        "confirm_awareness": "awareness_confirmation",
+        "classify_intent": "payment_intent",
+        "capture_commitment_date": "commitment_date",
+        "capture_payment_mode": "payment_mode",
+        "offer_payment_link": "link_channel",
+        "post_link_support_check": "post_link_support_check",
+        "schedule_callback": "callback_datetime",
+    }.get(state)
 
 
 def _base_data(
