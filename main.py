@@ -290,6 +290,12 @@ def classify_intent(utterance: str) -> str:
         r"\bpay\s+\d+\s+(?:now|today).*\b(rest|remaining)\b", text
     ):
         return "partial_ptp"
+    if _has(
+        text,
+        "waive", "waiver", "reduce emi", "emi reduction", "emi holiday",
+        "restructuring", "restructure", "settlement", "discount", "lower emi",
+    ):
+        return "wants_human"
     if _has(text, "speak to human", "real person", "manager", "agent", "representative",
             "account number de do", "account details chahiye", "loan details de do"):
         return "wants_human"
@@ -326,6 +332,8 @@ def resolve_intent_conflict(vapi_intent: str, keyword_intent: str, utterance: st
         return "third_party"
     if keyword == "hindi_switch":
         return "hindi_switch"
+    if keyword == "disputes_amount":
+        return "disputes_amount"
     if _is_borrower_confirmation(text) and "third_party" in {vapi, keyword}:
         return "borrower_confirmed"
     if keyword != "unknown" and vapi == "unknown":
@@ -375,10 +383,10 @@ def normalize_intent_for_state(state: str, intent: str, utterance: str) -> str:
         return intent
 
     if state == "self_identification":
-        if _is_affirmative(utterance):
-            return "aware"
         if _is_negative(utterance) or _is_soft_callback_request(utterance):
             return "callback_request"
+        if _is_affirmative(utterance):
+            return "aware"
         return intent
 
     if state in {"explain_dues", "confirm_awareness"}:
