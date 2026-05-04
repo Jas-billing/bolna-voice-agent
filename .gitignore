@@ -1,0 +1,20 @@
+cat > .gitignore << 'EOF'
+# Environment files - NEVER commit these
+.env
+.env.local
+.env.*.local
+*.env
+
+# Python virtual environment
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
