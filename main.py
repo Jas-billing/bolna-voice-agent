@@ -374,6 +374,7 @@ def normalize_intent_for_state(state: str, intent: str, utterance: str) -> str:
         "invalid_or_past_date",
         "will_pay_today",
         "will_pay_later",
+        "callback_request",
     }:
         return intent
 
