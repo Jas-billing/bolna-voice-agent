@@ -210,6 +210,18 @@ def classify_intent(utterance: str) -> str:
 
     if _has(text, "don't call", "dont call", "stop calling", "remove my number", "never call", "do not call"):
         return "opt_out"
+
+    # Bug A1: Loan-existence disputes must fire before wrong_number — "nahi liya" is a dispute,
+    # not a misdial.
+    if _has(
+        text,
+        "wrong amount", "incorrect amount", "don't owe", "dont owe", "not my amount",
+        "nahi liya", "loan nahi liya", "koi loan nahi", "koi loan nhi",
+        "no loan", "i did not take", "i have not taken", "i haven't taken",
+        "never took a loan", "did not take any loan",
+    ):
+        return "disputes_amount"
+
     if _has(
         text,
         "wrong number",
@@ -227,7 +239,15 @@ def classify_intent(utterance: str) -> str:
         return "financial_hardship"
     if _has(text, "won't pay", "wont pay", "not paying", "do whatever you want", "i don't want to pay", "dont want to pay"):
         return "refusal_to_pay"
+    # 3+ Hindi words in one utterance → route to Hindi callback before any English-token checks
+    # (prevents "nahi" triggering soft_negative instead of recognising a Hindi conversation)
+    if _count_hindi_words(text) >= 3:
+        return "hindi_switch"
     if _is_soft_negative(text):
+        return "callback_request"
+    # Vague payment intent must fire before borrower_confirmation and hindi_switch —
+    # "haa shayad karunga" is uncertainty, not confirmation.
+    if _is_vague_pay_intent(text):
         return "callback_request"
     if _is_borrower_confirmation(text):
         return "borrower_confirmed"
@@ -241,19 +261,40 @@ def classify_intent(utterance: str) -> str:
         return "third_party"
     if _has(text, "already paid", "paid yesterday", "payment done", "done payment", "i paid", "have paid"):
         return "claims_paid"
-    if _has(text, "wrong amount", "incorrect amount", "don't owe", "dont owe", "not my amount"):
-        return "disputes_amount"
-    if _has(text, "upi id", "card number", "otp", "cvv", "bank account", "account number") or re.search(
-        r"\b[\w.\-]{2,}@[a-zA-Z]{2,}\b", text
-    ):
+
+    # Bug A3: Only fire sensitive_pii_offered when customer is SHARING credentials, not
+    # requesting account info. Requesting routes to wants_human below.
+    if re.search(r"\b[\w.\-]{2,}@[a-zA-Z]{2,}\b", text):
         return "sensitive_pii_offered"
+    if _has(text, "upi id", "card number", "otp", "cvv", "bank account"):
+        _request_indicators = ("give me", "batao", "bata do", "de do", "chahiye", "mujhe chahiye",
+                               "share karo", "send karo", "what is my", "mera", "meri")
+        _sharing_indicators = ("my upi is", "upi id hai", "upi id he", "card number is",
+                               "my card", "otp is", "otp hai", "otp he", "cvv is", "cvv hai")
+        is_requesting = any(ind in text for ind in _request_indicators)
+        is_sharing = any(ind in text for ind in _sharing_indicators)
+        if is_sharing or not is_requesting:
+            return "sensitive_pii_offered"
+    if _has(text, "account number", "loan account", "account details", "loan details"):
+        _sharing_indicators = ("account number is", "account hai", "number is")
+        _request_indicators = ("give me", "batao", "bata do", "de do", "chahiye", "mujhe chahiye",
+                               "what is my", "mera", "meri", "account number de", "details de")
+        is_sharing = any(ind in text for ind in _sharing_indicators)
+        is_requesting = any(ind in text for ind in _request_indicators)
+        if is_sharing:
+            return "sensitive_pii_offered"
+        if is_requesting:
+            return "wants_human"
+
     if _has(text, "partial", "part payment", "rest next week", "some amount") or re.search(
         r"\bpay\s+\d+\s+(?:now|today).*\b(rest|remaining)\b", text
     ):
         return "partial_ptp"
-    if _has(text, "speak to human", "real person", "manager", "agent", "representative"):
+    if _has(text, "speak to human", "real person", "manager", "agent", "representative",
+            "account number de do", "account details chahiye", "loan details de do"):
         return "wants_human"
-    if _looks_hindi(text):
+    # Hindi: 3+ Hindi words in one utterance → escalate to Hindi callback immediately
+    if _count_hindi_words(text) >= 3 or _looks_hindi(text):
         return "hindi_switch"
     if _has(text, "45 days", "next month", "after two months", "after 2 months", "in 45 days"):
         return "long_dated_commitment"
@@ -476,11 +517,42 @@ def _is_third_party_denial(text: str) -> bool:
     )
 
 
+def _is_vague_pay_intent(text: str) -> bool:
+    """Uncertain payment language — not a firm commitment."""
+    vague = _has(text, "shayad", "maybe", "probably", "dekhte", "i'll try", "i will try", "baad mein")
+    pay_related = _has(text, "pay", "karunga", "karenge", "dunga", "bhar", "jama")
+    return vague and pay_related
+
+
+_HINDI_COMMON_TOKENS = {
+    "nahi", "nahin", "haan", "han", "paisa", "kal", "aaj", "mujhe", "hindi",
+    "baat", "karo", "karna", "theek", "abhi", "baad", "wala", "tumhe", "kyun",
+    "kaise", "kya", "hua", "raha", "hamara", "apna", "mein", "hain", "hai",
+    "toh", "aur", "lekin", "phir", "woh", "yeh",
+}
+_HINDI_STRONG_TOKENS = {
+    "shayad", "karunga", "karenge", "chahiye", "batao", "suniye",
+    "milega", "dekhte", "gaya", "gayi", "pehle", "dobara", "peechhe",
+    "samjha", "dunga", "dena", "lena", "bolunga", "biwi", "sasur",
+    "pareshaan", "dikkat", "zaroor", "zarurat",
+}
+
+
+def _count_hindi_words(text: str) -> int:
+    """Return count of Hindi/Hinglish tokens found in text."""
+    tokens = _tokens(text)
+    return len(tokens & (_HINDI_COMMON_TOKENS | _HINDI_STRONG_TOKENS))
+
+
 def _looks_hindi(text: str) -> bool:
     devanagari = bool(re.search(r"[ऀ-ॿ]", text))
-    hindi_tokens = {"nahi", "nahin", "haan", "han", "paisa", "kal", "aaj", "mujhe", "hindi", "baat", "karo", "karna"}
     tokens = _tokens(text)
-    return devanagari or "hindi" in tokens or len(tokens & hindi_tokens) >= 2
+    return (
+        devanagari
+        or "hindi" in tokens
+        or bool(tokens & _HINDI_STRONG_TOKENS)
+        or len(tokens & _HINDI_COMMON_TOKENS) >= 2
+    )
 
 
 # ── Date Parser ───────────────────────────────────────────────────────────────
@@ -574,6 +646,14 @@ def validate_commitment_date(raw_str: str, call_date: date, max_days: int = 14) 
             "reason": "past_date",
             "requires_human_callback": False,
         }
+    # Hard-reject far-future dates regardless of max_days (guards against year-2028-style inputs)
+    if (normalized - call_date).days > 365:
+        return {
+            "valid": False,
+            "normalized_date": normalized.isoformat(),
+            "reason": "outside_14_day_window",
+            "requires_human_callback": True,
+        }
     if normalized > call_date + timedelta(days=max_days):
         return {
             "valid": False,
@@ -600,7 +680,11 @@ def _clean_date(raw_str: str) -> str:
 def _is_random_or_ambiguous(text: str) -> bool:
     return any(
         phrase in text
-        for phrase in ("some random date", "random date", "someday", "whenever", "next week")
+        for phrase in (
+            "some random date", "random date", "someday", "whenever", "next week",
+            "shayad", "maybe", "probably", "dekhte hain", "baad mein dekhta",
+            "try karunga", "i'll try", "i will try",
+        )
     )
 
 
@@ -673,7 +757,7 @@ def schedule_callback(call_id: str, callback_datetime: str | None, reason: str) 
         "callback_datetime": callback_datetime,
         "reason": reason,
         "simulated": True,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(pytz.utc).isoformat(),
     }
     logger.info(f"EVENT | call_id={call_id} | event_type=human_callback_requested | reason={reason} | payload={json.dumps(payload)}")
     return payload
