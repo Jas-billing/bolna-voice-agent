@@ -418,6 +418,29 @@ def _is_soft_negative(text: str) -> bool:
 
 
 def _is_third_party_denial(text: str) -> bool:
+    relation_tokens = {
+        "brother", "sister", "father", "mother", "wife", "husband",
+        "friend", "son", "daughter", "uncle", "aunt", "cousin",
+    }
+    tokens = _tokens(text)
+    relation_present = bool(tokens & relation_tokens)
+    relation_context = _has(
+        text,
+        "i am",
+        "i'm",
+        "this is",
+        "speaking",
+        "his",
+        "her",
+        "rohit's",
+        "rohits",
+        "rohit ka",
+        "rohit ke",
+        "rohit ki",
+    )
+    if relation_present and relation_context:
+        return True
+
     return _has(
         text,
         "no i am his",
@@ -440,11 +463,16 @@ def _is_third_party_denial(text: str) -> bool:
         "i'm his husband",
         "i am someone else",
         "i'm someone else",
+        "someone else speaking",
         "not rohit",
+        "not rohit speaking",
+        "not rohit here",
         "not the person",
         "not the one",
+        "wrong person",
         "he is not here",
         "she is not here",
+        "rohit is not here",
     )
 
 
@@ -743,7 +771,7 @@ def process(
     final_intent = resolve_intent_conflict(vapi_detected_intent, backend_intent, latest_user_utterance)
     final_intent = normalize_intent_for_state(state, final_intent, latest_user_utterance)
     borrower_already_verified = bool(session.get("borrower_verified")) or state not in {"start", "verify_borrower"}
-    if borrower_already_verified and final_intent == "third_party":
+    if borrower_already_verified and final_intent == "third_party" and not _is_third_party_denial(latest_user_utterance):
         final_intent = backend_intent if backend_intent not in {"third_party", "unknown"} else "hindi_switch" if "hindi" in (latest_user_utterance or "").lower() else "unknown"
     data = _base_data(session, slots, backend_intent, final_intent, vapi_detected_intent)
     call_id = session["call_id"]
@@ -788,7 +816,7 @@ def process(
 
     if state == "self_identification":
         if final_intent == "callback_request" or _is_soft_callback_request(latest_user_utterance):
-            return _callback_request(call_id, slots, data)
+            return _callback_request(call_id, latest_user_utterance, slots, data)
         if _is_affirmative(latest_user_utterance) or final_intent in {"aware", "unaware", "borrower_confirmed"}:
             return _ask("confirm_awareness", "dues-disclosed", _response("dues", session, slots), "awareness_confirmation", data)
 
@@ -843,7 +871,10 @@ def process(
             escalation_reason="additional_query_after_ptp",
         )
 
-    if state in {"schedule_callback", "escalate", "close", "end_call"}:
+    if state == "schedule_callback":
+        return _callback_request(call_id, latest_user_utterance, slots, data)
+
+    if state in {"escalate", "close", "end_call"}:
         return _end("business_flow_completed", RESPONSES["close"], "business_flow_completed", data)
 
     return _ask("classify_intent", "unknown", RESPONSES["unknown"], None, data | {"requires_human_review": True})
@@ -885,7 +916,10 @@ def _handle_any_state_edges(
     if final_intent == "wrong_number":
         return _end("wrong-number", RESPONSES["wrong_number"], "privacy_protection", data | {"requires_human_review": True})
 
-    if final_intent == "third_party" and not session.get("borrower_verified") and state in {"start", "verify_borrower"}:
+    if final_intent == "third_party" and (
+        _is_third_party_denial(utterance)
+        or (not session.get("borrower_verified") and state in {"start", "verify_borrower"})
+    ):
         return _end("third-party-answered", _response("third_party", session, slots), "privacy_protection", data)
 
     if final_intent == "claims_paid":
@@ -1002,7 +1036,7 @@ def _handle_any_state_edges(
         )
 
     if final_intent == "callback_request" and state != "post_link_support_check":
-        return _callback_request(call_id, slots, data)
+        return _callback_request(call_id, utterance, slots, data)
 
     return None
 
@@ -1047,23 +1081,47 @@ def _handle_commitment_date(
         )
 
     amount = _extract_amount(latest_user_utterance, slots)
+    payment_mode = _payment_mode(latest_user_utterance, slots)
+    link_channel = _link_channel(latest_user_utterance, slots)
+    captured_data = data | {
+        "commitment_date": raw_commitment_date,
+        "partial_commitment_date": validation["normalized_date"],
+        "valid_ptp": True,
+        **({"commitment_amount": amount} if amount is not None else {}),
+        **({"payment_mode": payment_mode} if payment_mode else {}),
+        **({"link_channel": link_channel} if link_channel else {}),
+    }
+
+    if payment_mode and link_channel in {"sms", "whatsapp"}:
+        send_payment_link_simulated(call_id, link_channel, _customer_name(session, slots), _emi_due(session, slots))
+        return _ask(
+            "post_link_support_check",
+            f"commitment_mode_and_payment_link_{link_channel}_captured",
+            RESPONSES["post_link_check"],
+            "post_link_support_check",
+            captured_data,
+        )
+
+    if payment_mode:
+        return _ask(
+            "offer_payment_link",
+            "commitment_date_and_payment_mode_captured",
+            RESPONSES["payment_link"],
+            "link_channel",
+            captured_data,
+        )
+
     return _ask(
         "capture_payment_mode",
         "commitment_date_captured",
         RESPONSES["payment_mode"],
         "payment_mode",
-        data
-        | {
-            "commitment_date": raw_commitment_date,
-            "partial_commitment_date": validation["normalized_date"],
-            "valid_ptp": True,
-            **({"commitment_amount": amount} if amount is not None else {}),
-        },
+        captured_data,
     )
 
 
-def _callback_request(call_id: str, slots: dict[str, Any], data: dict[str, Any]) -> BackendResponse:
-    callback_datetime = slots.get("callback_datetime")
+def _callback_request(call_id: str, utterance: str, slots: dict[str, Any], data: dict[str, Any]) -> BackendResponse:
+    callback_datetime = slots.get("callback_datetime") or _extract_callback_datetime(utterance)
     if callback_datetime:
         schedule_callback(call_id, callback_datetime, "customer_requested_callback")
         return _end(
@@ -1203,6 +1261,30 @@ def _link_channel(utterance: str, slots: dict[str, Any]) -> str | None:
         return "whatsapp"
     if "sms" in text or "message" in text or "text" in text:
         return "sms"
+    return None
+
+
+def _extract_callback_datetime(utterance: str | None) -> str | None:
+    text = _normalize_text(utterance)
+    if not text:
+        return None
+
+    time_pattern = r"(?:at\s*)?\b(?:[01]?\d|2[0-3])(?::[0-5]\d)?\s*(?:am|pm)?\b"
+    day_pattern = r"\b(?:today|tomorrow|tonight|morning|afternoon|evening|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b"
+
+    for pattern in (
+        rf"(?:call|callback|call me|call back|later|meeting).*?({time_pattern}(?:\s*{day_pattern})?)",
+        rf"({time_pattern}\s*{day_pattern})",
+        rf"({day_pattern}\s*{time_pattern})",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            return re.sub(r"^at\s+", "", match.group(1).strip())
+
+    if re.search(day_pattern, text) and _has(text, "call", "callback", "call back", "later"):
+        match = re.search(day_pattern, text)
+        return match.group(0).strip() if match else None
+
     return None
 
 
