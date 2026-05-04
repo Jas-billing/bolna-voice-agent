@@ -725,7 +725,10 @@ def process(
             return _ask("confirm_awareness", "dues-disclosed", _response("dues", session, slots), "awareness_confirmation", data)
 
     if state in {"explain_dues", "confirm_awareness", "classify_intent"}:
-        if final_intent in {"aware", "unaware", "needs_help", "unknown"}:
+        if final_intent in {"aware", "unaware", "needs_help", "unknown"} or (
+            state == "confirm_awareness"
+            and (final_intent == "borrower_confirmed" or _is_affirmative(latest_user_utterance))
+        ):
             return _ask("classify_intent", "intent-clarification-needed", "Would you be able to make the EMI payment now or within the next few days?", "payment_intent", data)
         if final_intent in {"will_pay_today", "will_pay_later"}:
             return _handle_commitment_date(call_id, session, latest_user_utterance, slots, data)
