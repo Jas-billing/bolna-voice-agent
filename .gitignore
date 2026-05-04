@@ -1,4 +1,3 @@
-cat > .gitignore << 'EOF'
 # Environment files - NEVER commit these
 .env
 .env.local
@@ -18,3 +17,21 @@ __pycache__/
 
 # Logs
 *.log
+
+# Sensitive config files
+assistant_config.json
+tool_definition.json
+system_prompt.md
+workflow_pseudo_config.json
+
+# Reference & docs not needed for deployment
+vapi_coding_agent_reference_v2.md
+vapi_collections_voice_agent_prd (3).md
+VAPI_TESTING_CHECKLIST.md
+requirements-vapi.txt
+
+# Test & dev files
+web_test_call.html
+vapi_examples/
+current_tool_config.json
+vapi_agent_config.json

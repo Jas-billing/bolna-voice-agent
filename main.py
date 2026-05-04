@@ -265,10 +265,10 @@ def classify_intent(utterance: str) -> str:
         return "identity_clarified"
     if _has(text, "i'll pay", "i will pay", "will pay", "can pay", "paying today", "pay today", "pay now"):
         return will_pay_split(text)
-    if _has(text, "aware", "i know", "yes i know"):
-        return "aware"
     if _has(text, "not aware", "didn't know", "didnt know", "unaware"):
         return "unaware"
+    if _has(text, "aware", "i know", "yes i know"):
+        return "aware"
     if _has(text, "help", "option", "support"):
         return "needs_help"
     return "unknown"
@@ -305,6 +305,65 @@ def resolve_intent_conflict(vapi_intent: str, keyword_intent: str, utterance: st
     return keyword if keyword != "unknown" else vapi
 
 
+def normalize_intent_for_state(state: str, intent: str, utterance: str) -> str:
+    """Short Hinglish words are meaningful only in the current question context."""
+    if intent in {
+        "opt_out",
+        "wrong_number",
+        "third_party",
+        "claims_paid",
+        "disputes_amount",
+        "financial_hardship",
+        "legal_threat",
+        "harassment_claim",
+        "partial_ptp",
+        "refusal_to_pay",
+        "sensitive_pii_offered",
+        "wants_human",
+        "hindi_switch",
+        "long_dated_commitment",
+        "invalid_or_past_date",
+        "will_pay_today",
+        "will_pay_later",
+    }:
+        return intent
+
+    if state in {"start", "verify_borrower"}:
+        if _is_affirmative(utterance):
+            return "borrower_confirmed"
+        return intent
+
+    if state == "self_identification":
+        if _is_affirmative(utterance):
+            return "aware"
+        if _is_negative(utterance) or _is_soft_callback_request(utterance):
+            return "callback_request"
+        return intent
+
+    if state in {"explain_dues", "confirm_awareness"}:
+        if _is_unaware_response(utterance) or _is_negative(utterance):
+            return "unaware"
+        if _is_awareness_response(utterance) or _is_affirmative(utterance):
+            return "aware"
+        return intent
+
+    if state == "classify_intent":
+        if _is_affirmative(utterance):
+            return "will_pay_later"
+        if _is_negative(utterance):
+            return "callback_request"
+        return intent
+
+    if state == "post_link_support_check":
+        if _is_negative(utterance):
+            return "unknown"
+        if _is_affirmative(utterance):
+            return "needs_help"
+        return intent
+
+    return intent
+
+
 def will_pay_split(utterance: str) -> str:
     text = _normalize_text(utterance)
     if _has(text, "today", "now", "right now", "immediately"):
@@ -323,22 +382,30 @@ def _has(text: str, *patterns: str) -> bool:
     return any(pattern in text for pattern in patterns)
 
 
+AFFIRMATIVE_TOKENS = {
+    "yes", "yeah", "yep", "ya", "yaa", "yo", "yup",
+    "haan", "han", "ha", "haa", "haanji", "hanji", "ji",
+    "ok", "okay", "sure", "fine", "correct", "right", "alright",
+}
+
+NEGATIVE_TOKENS = {"no", "na", "nah", "nahi", "nahin", "nako", "nhi", "nope"}
+
+
+def _tokens(text_or_utterance: str | None) -> set[str]:
+    return set(re.findall(r"[a-z]+", _normalize_text(text_or_utterance)))
+
+
 def _is_borrower_confirmation(text: str) -> bool:
     if _is_third_party_denial(text):
         return False
-    tokens = set(re.findall(r"[a-z]+", text))
-    confirmation_tokens = {
-        "yes", "yeah", "yep", "ya", "yaa", "haan", "ha", "haa", "haanji", "hanji", "ji", "correct",
-    }
     confirmation_phrases = (
         "speaking", "this is", "i am rohit", "i'm rohit", "rohit bol", "main rohit", "mai rohit",
     )
-    return bool(tokens & confirmation_tokens) or _has(text, *confirmation_phrases)
+    return bool(_tokens(text) & AFFIRMATIVE_TOKENS) or _has(text, *confirmation_phrases)
 
 
 def _is_soft_negative(text: str) -> bool:
-    tokens = set(re.findall(r"[a-z]+", text))
-    return bool(tokens & {"no", "nahi", "nahin", "nako", "nhi", "nope"}) or _has(
+    return bool(_tokens(text) & NEGATIVE_TOKENS) or _has(
         text,
         "not now",
         "not available",
@@ -383,8 +450,8 @@ def _is_third_party_denial(text: str) -> bool:
 
 def _looks_hindi(text: str) -> bool:
     devanagari = bool(re.search(r"[ऀ-ॿ]", text))
-    hindi_tokens = {"nahi", "nahin", "haan", "paisa", "kal", "aaj", "mujhe", "hindi", "baat", "karo", "karna"}
-    tokens = set(re.findall(r"[a-z]+", text))
+    hindi_tokens = {"nahi", "nahin", "haan", "han", "paisa", "kal", "aaj", "mujhe", "hindi", "baat", "karo", "karna"}
+    tokens = _tokens(text)
     return devanagari or "hindi" in tokens or len(tokens & hindi_tokens) >= 2
 
 
@@ -642,8 +709,8 @@ RESPONSES = {
     "silence_first": "Are you still there?",
     "silence_final": "I am not able to hear you, so I will end the call now. Thank you.",
     "hindi_switch": "I understand you would prefer Hindi. I can arrange a callback from a Hindi-speaking support agent within 24 to 48 hours.",
-    "third_party": "Sorry, I can only discuss this with {customer_name}. I will call back later. Thank you.",
-    "wrong_number": "Sorry for the inconvenience. I will record this as a wrong number and end the call now. Thank you.",
+    "third_party": "Sorry, I can only speak with {customer_name}. I will call back later. Thank you for your time.",
+    "wrong_number": "Sorry for the inconvenience. I will record this as a wrong number and end the call now. Thank you for your time.",
     "compliance": "I am sorry for the inconvenience. I will stop this reminder flow and escalate your concern for review. Thank you for informing us.",
     "partial_ptp": "I have noted that you may be able to make a partial payment. Since this needs review, I will arrange a callback from our support team within 24 to 48 hours.",
     "clarify_date": "Could you please confirm the exact date you plan to pay?",
@@ -674,6 +741,7 @@ def process(
     state = session.get("current_state") or slots.get("current_state") or "start"
     backend_intent = classify_intent(latest_user_utterance)
     final_intent = resolve_intent_conflict(vapi_detected_intent, backend_intent, latest_user_utterance)
+    final_intent = normalize_intent_for_state(state, final_intent, latest_user_utterance)
     borrower_already_verified = bool(session.get("borrower_verified")) or state not in {"start", "verify_borrower"}
     if borrower_already_verified and final_intent == "third_party":
         final_intent = backend_intent if backend_intent not in {"third_party", "unknown"} else "hindi_switch" if "hindi" in (latest_user_utterance or "").lower() else "unknown"
@@ -732,6 +800,8 @@ def process(
             return _ask("classify_intent", "intent-clarification-needed", "Would you be able to make the EMI payment now or within the next few days?", "payment_intent", data)
         if final_intent in {"will_pay_today", "will_pay_later"}:
             return _handle_commitment_date(call_id, session, latest_user_utterance, slots, data)
+        if state == "classify_intent" and _is_affirmative(latest_user_utterance):
+            return _ask("capture_commitment_date", "commitment-date-required", "Could you please confirm the exact date you plan to pay?", "commitment_date", data)
 
     if state == "capture_commitment_date":
         return _handle_commitment_date(call_id, session, latest_user_utterance, slots, data)
@@ -1148,25 +1218,44 @@ def _extract_amount(utterance: str, slots: dict[str, Any]) -> int | None:
 
 def _is_affirmative(utterance: str) -> bool:
     text = (utterance or "").lower()
-    return any(
-        token in text
-        for token in (
-            "yes", "yeah", "yep", "ya", "yaa", "haan", "ha", "haa",
-            "haanji", "hanji", "ji", "ok", "okay", "sure", "fine",
-            "go ahead", "speaking", "correct",
-        )
+    return bool(_tokens(text) & AFFIRMATIVE_TOKENS) or _has(
+        text,
+        "go ahead",
+        "speaking",
+        "sounds good",
+        "that is fine",
+        "that's fine",
     )
 
 
 def _is_negative(utterance: str) -> bool:
     text = (utterance or "").lower()
-    return any(token in text for token in ("no", "nahi", "nahin", "nako", "nhi", "nothing", "that's all", "that is all", "no thanks", "no thank"))
+    return bool(_tokens(text) & NEGATIVE_TOKENS) or _has(
+        text,
+        "nothing",
+        "that's all",
+        "that is all",
+        "no thanks",
+        "no thank",
+        "not aware",
+        "didn't know",
+        "didnt know",
+    )
+
+
+def _is_awareness_response(utterance: str) -> bool:
+    text = _normalize_text(utterance)
+    return _has(text, "aware", "i know", "i am aware", "yes i know", "haan pata", "pata hai")
+
+
+def _is_unaware_response(utterance: str) -> bool:
+    text = _normalize_text(utterance)
+    return _has(text, "unaware", "not aware", "didn't know", "didnt know", "i don't know", "i dont know", "pata nahi", "malum nahi")
 
 
 def _is_soft_callback_request(utterance: str) -> bool:
     text = (utterance or "").lower()
-    tokens = set(re.findall(r"[a-z]+", text))
-    return bool(tokens & {"no", "nahi", "nahin", "nako", "nhi", "nope"}) or any(
+    return bool(_tokens(text) & NEGATIVE_TOKENS) or any(
         phrase in text
         for phrase in (
             "not now", "not available", "not a good time", "busy",
