@@ -13,6 +13,7 @@ from typing import Any, Literal
 import pytz
 from dateutil import parser as dateutil_parser
 from dateutil.relativedelta import relativedelta
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -26,9 +27,10 @@ logger = logging.getLogger(__name__)
 
 # ── App ──────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="ABC Finance Vapi Collections Backend", version="2.0.0")
+app = FastAPI(title="ABC Finance Voice Agent Backend", version="2.1.0")
 
 IST = pytz.timezone("Asia/Kolkata")
+BOLNA_API_BASE_URL = os.getenv("BOLNA_API_BASE_URL", "https://api.bolna.ai").rstrip("/")
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
@@ -61,7 +63,7 @@ Intent = Literal[
 ]
 
 
-class VapiToolCallRequest(BaseModel):
+class BolnaTurnRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     call_id: str
@@ -81,7 +83,7 @@ class VapiToolCallRequest(BaseModel):
     dispute_reason: str | None = None
 
     @model_validator(mode="after")
-    def normalize_blank_optionals(self) -> "VapiToolCallRequest":
+    def normalize_blank_optionals(self) -> "BolnaTurnRequest":
         for field_name in (
             "commitment_date",
             "payment_mode",
@@ -136,18 +138,32 @@ class BackendResponse(BaseModel):
     data_to_log: dict[str, Any] = Field(default_factory=dict)
 
 
-class EndOfCallPayload(BaseModel):
+class BolnaOutboundCallRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    call_id: str
-    vapi_call_id: str | None = None
-    ended_reason_from_vapi: str
-    started_at: str | None = None
-    ended_at: str | None = None
-    duration_seconds: int = 0
+    recipient_phone_number: str
+    agent_id: str | None = None
+    from_phone_number: str | None = None
+    scheduled_at: str | None = None
+    user_data: dict[str, Any] = Field(default_factory=dict)
+
+
+class BolnaOutboundCallResponse(BaseModel):
+    message: str | None = None
+    status: str | None = None
+    execution_id: str | None = None
+    raw_response: dict[str, Any] = Field(default_factory=dict)
+
+
+class BolnaExecutionWebhookPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: str | None = None
+    execution_id: str | None = None
+    agent_id: str | None = None
+    status: str | None = None
     transcript: str | None = None
-    messages: list[Any] = Field(default_factory=list)
-    recording_url: str | None = None
+    extracted_data: dict[str, Any] | None = None
     summary: str | None = None
     raw_payload: dict[str, Any] = Field(default_factory=dict)
 
@@ -1552,72 +1568,75 @@ def health() -> dict[str, str]:
     return {"status": "ok", "mode": "stateless"}
 
 
-@app.post("/vapi/handle-customer-turn")
-async def handle_customer_turn_endpoint(payload: VapiToolCallRequest) -> dict[str, Any]:
+@app.post("/bolna/handle-customer-turn")
+async def bolna_handle_customer_turn_endpoint(payload: BolnaTurnRequest) -> dict[str, Any]:
     result = handle_customer_turn(payload)
     return result.model_dump(mode="json")
 
 
-@app.post("/vapi/webhook")
-async def vapi_webhook(request: Request) -> dict[str, Any]:
-    body = await request.json()
-    message = body.get("message", body)
-    message_type = message.get("type") or body.get("type")
+@app.post("/bolna/call")
+async def make_bolna_call(payload: BolnaOutboundCallRequest) -> dict[str, Any]:
+    api_key = os.getenv("BOLNA_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="BOLNA_API_KEY is not configured")
 
-    if message_type == "tool-calls":
-        results = []
-        for tool_call in _tool_calls(message):
-            tool_call_id = tool_call.get("id") or tool_call.get("toolCallId")
-            try:
-                name = _tool_name(tool_call)
-                if name != "handle_customer_turn":
-                    logger.info(f"Ignoring unsupported tool call | tool_name={name}")
-                    continue
-                arguments = _tool_arguments(tool_call)
-                arguments["call_id"] = arguments.get("call_id") or get_call_id({"message": message, "tool_call": tool_call})
-                arguments["current_state"] = arguments.get("current_state") or "verify_borrower"
-                tool_request = VapiToolCallRequest.model_validate(arguments)
-                result = handle_customer_turn(tool_request)
-                results.append(
-                    {
-                        "toolCallId": tool_call_id,
-                        "result": json.dumps(result.model_dump(mode="json")),
-                    }
-                )
-            except Exception as exc:
-                logger.exception(f"Vapi tool-call webhook failed | tool_call_id={tool_call_id}")
-                fallback = _technical_failure_response(exc)
-                results.append(
-                    {
-                        "toolCallId": tool_call_id,
-                        "result": json.dumps(fallback.model_dump(mode="json")),
-                    }
-                )
-        return {"results": results}
+    agent_id = payload.agent_id or os.getenv("BOLNA_AGENT_ID")
+    if not agent_id:
+        raise HTTPException(status_code=422, detail="agent_id is required or BOLNA_AGENT_ID must be configured")
 
-    if message_type in {"end-of-call-report", "call-ended", "end_call_report"}:
-        payload = normalize_end_of_call_payload(body)
-        handle_end_of_call(payload)
-        return {"status": "ok"}
+    outbound_payload: dict[str, Any] = {
+        "agent_id": agent_id,
+        "recipient_phone_number": payload.recipient_phone_number,
+        "user_data": payload.user_data,
+    }
+    from_phone_number = payload.from_phone_number or os.getenv("BOLNA_FROM_PHONE_NUMBER")
+    if from_phone_number:
+        outbound_payload["from_phone_number"] = from_phone_number
+    if payload.scheduled_at:
+        outbound_payload["scheduled_at"] = payload.scheduled_at
 
-    logger.info(f"Unsupported Vapi webhook message type | message_type={message_type}")
-    return {"status": "ignored"}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"{BOLNA_API_BASE_URL}/call",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=outbound_payload,
+            )
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = _safe_json(exc.response) or {"message": exc.response.text}
+        logger.warning(f"Bolna call request failed | status={exc.response.status_code} | detail={detail}")
+        raise HTTPException(status_code=exc.response.status_code, detail=detail) from exc
+    except httpx.HTTPError as exc:
+        logger.exception("Bolna call request failed")
+        raise HTTPException(status_code=502, detail=f"Bolna request failed: {type(exc).__name__}") from exc
 
-
-def _technical_failure_response(exc: Exception) -> BackendResponse:
-    return _end(
-        "technical-failure",
-        "I cannot verify this right now. I will arrange a callback from our support team within 24 to 48 hours. Thank you for your time.",
-        end_reason="technical_failure",
-        data={
-            "technical_failure": True,
-            "error_type": type(exc).__name__,
-            "requires_human_callback": True,
-        },
+    body = response.json()
+    result = BolnaOutboundCallResponse(
+        message=body.get("message"),
+        status=body.get("status"),
+        execution_id=body.get("execution_id"),
+        raw_response=body,
     )
+    logger.info(
+        f"BOLNA_CALL | execution_id={result.execution_id} | "
+        f"status={result.status} | recipient={payload.recipient_phone_number}"
+    )
+    return result.model_dump(mode="json")
 
 
-def handle_customer_turn(payload: VapiToolCallRequest) -> BackendResponse:
+@app.post("/bolna/webhook")
+async def bolna_webhook(request: Request) -> dict[str, Any]:
+    body = await request.json()
+    payload = normalize_bolna_webhook_payload(body)
+    handle_bolna_execution_update(payload)
+    return {"status": "ok"}
+
+
+def handle_customer_turn(payload: BolnaTurnRequest) -> BackendResponse:
     # State is derived entirely from the inbound request — no DB lookup.
     # borrower_verified is inferred from current_state position in the flow.
     # tool_failure_count is inferred from silence_reprompt state (== 1, else 0).
@@ -1647,128 +1666,39 @@ def handle_customer_turn(payload: VapiToolCallRequest) -> BackendResponse:
     return result
 
 
-def handle_end_of_call(payload: EndOfCallPayload) -> None:
+def normalize_bolna_webhook_payload(body: dict[str, Any]) -> BolnaExecutionWebhookPayload:
+    execution_id = body.get("execution_id") or body.get("id") or body.get("call_id")
+    payload = {
+        "id": body.get("id") or execution_id,
+        "execution_id": execution_id,
+        "agent_id": body.get("agent_id"),
+        "status": body.get("status"),
+        "transcript": body.get("transcript"),
+        "extracted_data": body.get("extracted_data"),
+        "summary": body.get("summary"),
+        "raw_payload": body,
+    }
+    return BolnaExecutionWebhookPayload.model_validate(payload)
+
+
+def handle_bolna_execution_update(payload: BolnaExecutionWebhookPayload) -> None:
     data = payload.model_dump(mode="json")
-    call_id = data["call_id"]
-    ended_reason = data.get("ended_reason_from_vapi") or "unknown"
     transcript = data.get("transcript")
     requires_redaction = _contains_sensitive_payment_data(transcript)
     final_transcript = "[REDACTED_SENSITIVE_PAYMENT_DETAILS]" if requires_redaction else transcript
-
-    report: dict[str, Any] = {
-        **data,
+    report = data | {
         "requires_redaction": requires_redaction,
         "final_transcript": final_transcript,
     }
-
-    if _looks_like_dropped_call(ended_reason):
-        last_state = "verify_borrower"
-        dropped_event = _dropped_event_for_state(last_state)
-        report["final_outcome"] = "call-dropped"
-        report["dropped_event"] = dropped_event
-        report["end_reason"] = "customer_hung_up"
-
-    logger.info(f"END_OF_CALL | call_id={call_id} | ended_reason={ended_reason} | payload={json.dumps(report, default=str)}")
-
-
-def get_call_id(request_body: dict[str, Any]) -> str:
-    tool_call = request_body.get("tool_call") or {}
-    arguments = _tool_arguments(tool_call) if tool_call else {}
-    if arguments.get("call_id"):
-        return str(arguments["call_id"])
-
-    message = request_body.get("message", request_body)
-    for path in (
-        ("metadata", "call_id"),
-        ("metadata", "session_id"),
-        ("assistant", "metadata", "call_id"),
-        ("assistant", "metadata", "session_id"),
-        ("call", "id"),
-        ("call", "callId"),
-        ("call_id",),
-        ("callId",),
-        ("id",),
-    ):
-        value = _nested_get(message, path)
-        if value:
-            return str(value)
-
-    if tool_call.get("id") or tool_call.get("toolCallId"):
-        return str(tool_call.get("id") or tool_call.get("toolCallId"))
-
-    raise HTTPException(status_code=422, detail="call_id missing from tool parameters and Vapi message.call.id")
-
-
-def normalize_end_of_call_payload(body: dict[str, Any]) -> EndOfCallPayload:
-    message = body.get("message", body)
-    call = message.get("call") or body.get("call") or {}
-    call_id = (
-        message.get("call_id")
-        or message.get("callId")
-        or call.get("id")
-        or call.get("callId")
-        or body.get("call_id")
-        or body.get("callId")
+    logger.info(
+        f"BOLNA_WEBHOOK | execution_id={payload.execution_id or payload.id} | "
+        f"agent_id={payload.agent_id} | status={payload.status} | payload={json.dumps(report, default=str)}"
     )
-    if not call_id:
-        raise HTTPException(status_code=422, detail="call_id missing from end-of-call payload")
-
-    payload = {
-        "call_id": str(call_id),
-        "vapi_call_id": call.get("id") or call.get("callId") or str(call_id),
-        "ended_reason_from_vapi": message.get("endedReason") or message.get("ended_reason") or body.get("endedReason") or "unknown",
-        "started_at": message.get("startedAt") or call.get("startedAt"),
-        "ended_at": message.get("endedAt") or call.get("endedAt"),
-        "duration_seconds": int(message.get("durationSeconds") or message.get("duration_seconds") or 0),
-        "transcript": message.get("transcript"),
-        "messages": message.get("messages") or [],
-        "recording_url": message.get("recordingUrl") or message.get("recording_url"),
-        "summary": message.get("summary"),
-        "raw_payload": body,
-    }
-    return EndOfCallPayload.model_validate(payload)
 
 
-def _tool_name(tool_call: dict[str, Any]) -> str | None:
-    function = tool_call.get("function") or {}
-    return tool_call.get("name") or function.get("name")
-
-
-def _tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
-    calls = (
-        message.get("toolCalls")
-        or message.get("tool_calls")
-        or message.get("toolCallList")
-        or []
-    )
-    if calls:
-        return calls
-
-    tool_with_call_list = message.get("toolWithToolCallList") or []
-    extracted = []
-    for item in tool_with_call_list:
-        if isinstance(item, dict) and isinstance(item.get("toolCall"), dict):
-            extracted.append(item["toolCall"])
-    return extracted
-
-
-def _tool_arguments(tool_call: dict[str, Any]) -> dict[str, Any]:
-    function = tool_call.get("function") or {}
-    arguments = tool_call.get("arguments") or function.get("arguments") or function.get("parameters") or {}
-    if isinstance(arguments, str):
-        try:
-            return json.loads(arguments)
-        except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=422, detail="Invalid JSON tool arguments") from exc
-    if isinstance(arguments, dict):
-        return dict(arguments)
-    return {}
-
-
-def _nested_get(data: dict[str, Any], path: tuple[str, ...]) -> Any:
-    current: Any = data
-    for key in path:
-        if not isinstance(current, dict):
-            return None
-        current = current.get(key)
-    return current
+def _safe_json(response: httpx.Response) -> dict[str, Any] | None:
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    return body if isinstance(body, dict) else {"response": body}
