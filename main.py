@@ -64,6 +64,23 @@ Intent = Literal[
 ]
 
 
+def _is_unresolved_placeholder(value: Any) -> bool:
+    """Return True if Bolna failed to substitute a {variable} and sent the raw placeholder."""
+    if isinstance(value, str):
+        s = value.strip()
+        return s.startswith("{") and s.endswith("}")
+    return False
+
+
+def _safe_float(value: Any) -> float | None:
+    if value is None or _is_unresolved_placeholder(value):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class BolnaTurnRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -73,15 +90,30 @@ class BolnaTurnRequest(BaseModel):
     detected_intent: str = "unknown"
     customer_name: str = ""
     loan_amount: float | None = None
-    emi_due: float
-    due_date: str
-    days_past_due: float
+    emi_due: float | None = None
+    due_date: str | None = None
+    days_past_due: float | None = None
     commitment_date: str | None = None
     commitment_amount: float | None = None
     payment_mode: Literal["UPI", "net_banking", "card", "cash_deposit", "unknown"] | None = None
     link_channel: Literal["sms", "whatsapp", "none", "unknown"] | None = None
     callback_datetime: str | None = None
     dispute_reason: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def sanitize_placeholders(cls, data: Any) -> Any:
+        """Replace unresolved {variable} placeholders and coerce numeric fields before validation."""
+        if not isinstance(data, dict):
+            return data
+        for field in ("loan_amount", "emi_due", "days_past_due", "commitment_amount"):
+            if field in data and _is_unresolved_placeholder(data[field]):
+                data[field] = None
+        for field in ("customer_name", "due_date", "call_id", "current_state",
+                      "latest_user_utterance", "detected_intent"):
+            if field in data and _is_unresolved_placeholder(data[field]):
+                data[field] = None
+        return data
 
     @model_validator(mode="after")
     def normalize_blank_optionals(self) -> "BolnaTurnRequest":
@@ -97,6 +129,10 @@ class BolnaTurnRequest(BaseModel):
                 setattr(self, field_name, None)
         if self.detected_intent not in INTENTS:
             self.detected_intent = "unknown"
+        if not self.customer_name:
+            self.customer_name = ""
+        if not self.current_state:
+            self.current_state = "verify_borrower"
         return self
 
     def slots(self) -> dict[str, Any]:
@@ -924,10 +960,7 @@ def process(
     if global_edge is not None:
         return global_edge
 
-    if state == "start":
-        return _ask("verify_borrower", "verification_started", f"Hi, am I speaking with {_customer_name(session, slots)}?", "borrower_confirmation", data)
-
-    if state == "verify_borrower":
+    if state in {"start", "verify_borrower"}:
         if final_intent == "borrower_confirmed" or _is_affirmative(latest_user_utterance):
             return _ask(
                 "self_identification",
@@ -1634,11 +1667,10 @@ async def bolna_handle_customer_turn_endpoint(payload: BolnaTurnRequest) -> dict
 
 @app.post("/bolna/test-turn")
 async def bolna_test_turn_endpoint(payload: BolnaTurnRequest) -> dict[str, Any]:
-    """Same as handle-customer-turn but fills missing loan fields from DUMMY_USER_DATA.
-    Use this endpoint while testing from the Bolna dashboard before real user_data is wired up."""
+    """Same as handle-customer-turn but fills missing/placeholder loan fields from DUMMY_USER_DATA."""
     filled = payload.model_dump(mode="json")
     for field, default in DUMMY_USER_DATA.items():
-        if not filled.get(field):
+        if not filled.get(field) or _is_unresolved_placeholder(filled.get(field)):
             filled[field] = default
     filled.setdefault("current_state", "verify_borrower")
     test_payload = BolnaTurnRequest.model_validate(filled)
@@ -1709,9 +1741,18 @@ async def bolna_webhook(request: Request) -> dict[str, Any]:
 
 
 def handle_customer_turn(payload: BolnaTurnRequest) -> BackendResponse:
-    # State is derived entirely from the inbound request — no DB lookup.
-    # borrower_verified is inferred from current_state position in the flow.
-    # tool_failure_count is inferred from silence_reprompt state (== 1, else 0).
+    # Guard: if the function was called before the customer said anything (empty utterance
+    # at start/verify_borrower), return a no-op so the agent waits for the customer to speak.
+    if not (payload.latest_user_utterance or "").strip() and payload.current_state in {"start", "verify_borrower"}:
+        return BackendResponse(
+            action="ask",
+            should_end_call=False,
+            next_state="verify_borrower",
+            logged_outcome="no-utterance-wait",
+            allowed_response="",
+            data_to_log={},
+        )
+
     session = {
         "call_id": payload.call_id,
         "current_state": payload.current_state,
