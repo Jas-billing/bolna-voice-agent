@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from datetime import date, datetime, timedelta
 from typing import Any, Literal
 
@@ -66,11 +67,11 @@ Intent = Literal[
 class BolnaTurnRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    call_id: str
+    call_id: str = Field(default_factory=lambda: f"bolna-{uuid.uuid4().hex[:12]}")
     current_state: str = "verify_borrower"
-    latest_user_utterance: str
-    detected_intent: Intent
-    customer_name: str
+    latest_user_utterance: str = ""
+    detected_intent: str = "unknown"
+    customer_name: str = ""
     loan_amount: float | None = None
     emi_due: float
     due_date: str
@@ -94,6 +95,8 @@ class BolnaTurnRequest(BaseModel):
             value = getattr(self, field_name)
             if isinstance(value, str) and not value.strip():
                 setattr(self, field_name, None)
+        if self.detected_intent not in INTENTS:
+            self.detected_intent = "unknown"
         return self
 
     def slots(self) -> dict[str, Any]:
@@ -549,6 +552,20 @@ def _is_vague_pay_intent(text: str) -> bool:
     return vague and pay_related
 
 
+def _is_mid_call_third_party(text: str, customer_name: str) -> bool:
+    """Catch mid-call reveals that the person is not the borrower."""
+    if _is_third_party_denial(text):
+        return True
+    name = customer_name.lower().strip()
+    return _has(
+        text,
+        f"not {name}", f"i am not {name}", f"i'm not {name}",
+        "actually i am", "actually i'm", "i lied", "i was lying",
+        "not the person", "not him", "not her", "someone else",
+        "not the right person", "mein nahin hoon", "main nahi hoon",
+    )
+
+
 _HINDI_COMMON_TOKENS = {
     "nahi", "nahin", "haan", "han", "paisa", "kal", "aaj", "mujhe", "hindi",
     "baat", "karo", "karna", "theek", "abhi", "baad", "wala", "tumhe", "kyun",
@@ -856,6 +873,7 @@ RESPONSES = {
     "identity": "I am Priya, a virtual assistant calling from ABC Finance about your personal loan EMI reminder.",
     "sensitive_pii": "For your security, please do not share UPI IDs, card numbers, OTPs, or bank details on this call. I can send a secure payment link to your registered number instead.",
     "claims_paid_plus_dnc": "Thank you for letting me know. I will mark your payment claim for verification and also record your request not to receive further calls. I will end the call now.",
+    "refusal_soft": "I understand. Is there a specific concern I can help with, or would you like me to arrange a callback from our support team at a better time?",
     "refusal": "I understand. I will arrange a callback from our support team within 24 to 48 hours to understand your concern and see how they can help. Thank you for your time.",
     "payment_mode": "Thank you. Which mode will you use — UPI, net banking, card, or cash deposit?",
     "payment_link": "I can send the payment link to your registered number by SMS or WhatsApp. Which would you prefer?",
@@ -881,7 +899,13 @@ def process(
     final_intent = resolve_intent_conflict(vapi_detected_intent, backend_intent, latest_user_utterance)
     final_intent = normalize_intent_for_state(state, final_intent, latest_user_utterance)
     borrower_already_verified = bool(session.get("borrower_verified")) or state not in {"start", "verify_borrower"}
-    if borrower_already_verified and final_intent == "third_party" and not _is_third_party_denial(latest_user_utterance):
+    # Mid-call third-party: suppress false positives BUT trust the LLM when it explicitly says third_party
+    if (
+        borrower_already_verified
+        and final_intent == "third_party"
+        and vapi_detected_intent != "third_party"
+        and not _is_mid_call_third_party(latest_user_utterance, _customer_name(session, slots))
+    ):
         final_intent = backend_intent if backend_intent not in {"third_party", "unknown"} else "hindi_switch" if "hindi" in (latest_user_utterance or "").lower() else "unknown"
     data = _base_data(session, slots, backend_intent, final_intent, vapi_detected_intent)
     call_id = session["call_id"]
@@ -1003,6 +1027,24 @@ def process(
             return _input_not_captured("schedule_callback", data, session, slots)
         return _callback_request(call_id, latest_user_utterance, slots, data)
 
+    if state == "handle_refusal":
+        # Customer responded to soft refusal question — route based on what they said
+        if final_intent == "callback_request" or _is_soft_callback_request(latest_user_utterance):
+            return _callback_request(call_id, latest_user_utterance, slots, data)
+        if final_intent == "financial_hardship":
+            schedule_callback(call_id, slots.get("callback_datetime"), "financial_hardship")
+            return _end("financial-hardship-human-callback", RESPONSES["financial_hardship"], "escalation_required",
+                        data | {"requires_human_callback": True}, escalation_reason="hardship_flagged")
+        if final_intent == "wants_human":
+            transfer_to_human_simulated(call_id, "human_requested")
+            return _end("human-callback-requested", RESPONSES["human"], "escalation_required",
+                        data | {"requires_human_callback": True}, escalation_reason="human_requested")
+        # Any other response at this point — end politely with human callback scheduled
+        schedule_callback(call_id, slots.get("callback_datetime"), "refusal_to_pay")
+        return _end("refusal-confirmed", RESPONSES["refusal"], "escalation_required",
+                    data | {"requires_human_callback": True, "valid_ptp": False},
+                    escalation_reason="refusal_to_pay")
+
     if state in {"escalate", "close", "end_call"}:
         return _end("business_flow_completed", RESPONSES["close"], "business_flow_completed", data)
 
@@ -1046,7 +1088,7 @@ def _handle_any_state_edges(
         return _end("wrong-number", RESPONSES["wrong_number"], "privacy_protection", data | {"requires_human_review": True})
 
     if final_intent == "third_party" and (
-        _is_third_party_denial(utterance)
+        _is_mid_call_third_party(utterance, customer_name)
         or (not session.get("borrower_verified") and state in {"start", "verify_borrower"})
     ):
         return _end("third-party-answered", _response("third_party", session, slots), "privacy_protection", data)
@@ -1139,19 +1181,26 @@ def _handle_any_state_edges(
         )
 
     if final_intent == "refusal_to_pay":
-        schedule_callback(call_id, slots.get("callback_datetime"), "refusal_to_pay")
-        return _end(
-            "refusal-to-pay-human-callback",
-            RESPONSES["refusal"],
-            "escalation_required",
-            data
-            | {
-                "risk_attribute": "refusal_to_pay",
-                "risk_level": "medium",
-                "requires_human_callback": True,
-                "valid_ptp": False,
-            },
-            escalation_reason="refusal_to_pay",
+        if state == "handle_refusal":
+            schedule_callback(call_id, slots.get("callback_datetime"), "refusal_to_pay")
+            return _end(
+                "refusal-to-pay-human-callback",
+                RESPONSES["refusal"],
+                "escalation_required",
+                data | {
+                    "risk_attribute": "refusal_to_pay",
+                    "risk_level": "medium",
+                    "requires_human_callback": True,
+                    "valid_ptp": False,
+                },
+                escalation_reason="refusal_to_pay",
+            )
+        return _ask(
+            "handle_refusal",
+            "soft-refusal-acknowledged",
+            RESPONSES["refusal_soft"],
+            None,
+            data | {"risk_attribute": "refusal_to_pay", "valid_ptp": False},
         )
 
     if final_intent == "wants_human":
