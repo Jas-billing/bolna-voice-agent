@@ -1568,9 +1568,32 @@ def health() -> dict[str, str]:
     return {"status": "ok", "mode": "stateless"}
 
 
+DUMMY_USER_DATA = {
+    "customer_name": "Rohit",
+    "loan_amount": 120000.0,
+    "emi_due": 8500.0,
+    "due_date": "2026-04-25",
+    "days_past_due": 7.0,
+}
+
+
 @app.post("/bolna/handle-customer-turn")
 async def bolna_handle_customer_turn_endpoint(payload: BolnaTurnRequest) -> dict[str, Any]:
     result = handle_customer_turn(payload)
+    return result.model_dump(mode="json")
+
+
+@app.post("/bolna/test-turn")
+async def bolna_test_turn_endpoint(payload: BolnaTurnRequest) -> dict[str, Any]:
+    """Same as handle-customer-turn but fills missing loan fields from DUMMY_USER_DATA.
+    Use this endpoint while testing from the Bolna dashboard before real user_data is wired up."""
+    filled = payload.model_dump(mode="json")
+    for field, default in DUMMY_USER_DATA.items():
+        if not filled.get(field):
+            filled[field] = default
+    filled.setdefault("current_state", "verify_borrower")
+    test_payload = BolnaTurnRequest.model_validate(filled)
+    result = handle_customer_turn(test_payload)
     return result.model_dump(mode="json")
 
 
